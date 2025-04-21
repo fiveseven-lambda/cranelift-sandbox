@@ -185,6 +185,18 @@ fn const_expr(expr: Expr) -> Expr {
             Func::Builtin(make_int as i64, vec![Ty::Int], Ty::Ptr),
             vec![Expr::Int(value)],
         ),
+        Expr::Tys(value) => Expr::App(
+            Func::Builtin(make_tys as i64, vec![Ty::Ptr], Ty::Ptr),
+            vec![Expr::Tys(value)],
+        ),
+        Expr::Ty(value) => Expr::App(
+            Func::Builtin(make_ty as i64, vec![Ty::Ptr], Ty::Ptr),
+            vec![Expr::Ty(value)],
+        ),
+        Expr::Exprs(exprs) => Expr::App(
+            Func::Builtin(make_exprs as i64, vec![Ty::Ptr], Ty::Ptr),
+            vec![Expr::Exprs(exprs.into_iter().map(const_expr).collect())],
+        ),
         Expr::App(func, args) => Expr::App(
             Func::Builtin(make_app as i64, vec![Ty::Ptr, Ty::Ptr], Ty::Ptr),
             vec![
@@ -267,16 +279,21 @@ fn main() {
     println!("new_vec_expr: {0} = 0x{0:x}", new_vec_expr as usize);
     println!("push_vec_expr: {0} = 0x{0:x}", push_vec_expr as usize);
 
-    let expr = const_expr(const_expr(Expr::Int(42)));
+    let mut expr = Expr::Int(42);
+    let n = 6;
+
+    for _ in 0..n {
+        expr = const_expr(expr);
+    }
+
     println!("{expr:?}");
-    let ptr = compile(declare_anonymous_function(), vec![expr], &[], &Ty::Ptr);
-    let func: unsafe fn() -> *mut Expr = unsafe { std::mem::transmute(ptr) };
-    let expr = *unsafe { Box::from_raw(func()) };
-    println!("{expr:?}");
-    let ptr = compile(declare_anonymous_function(), vec![expr], &[], &Ty::Ptr);
-    let func: unsafe fn() -> *mut Expr = unsafe { std::mem::transmute(ptr) };
-    let expr = *unsafe { Box::from_raw(func()) };
-    println!("{expr:?}");
+
+    for _ in 0..n {
+        let ptr = compile(declare_anonymous_function(), vec![expr], &[], &Ty::Ptr);
+        let func: unsafe fn() -> *mut Expr = unsafe { std::mem::transmute(ptr) };
+        expr = *unsafe { Box::from_raw(func()) };
+    }
+
     let ptr = compile(declare_anonymous_function(), vec![expr], &[], &Ty::Int);
     let func: unsafe fn() -> i64 = unsafe { std::mem::transmute(ptr) };
     println!("{}", unsafe { func() });
