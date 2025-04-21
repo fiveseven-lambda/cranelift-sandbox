@@ -1,218 +1,287 @@
-use std::iter;
-
-use codegen::ir;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::Module;
-use isa::CallConv;
+use cranelift_module::{FuncId, Module};
+use std::sync::{LazyLock, Mutex};
 
+static JIT_MODULE: LazyLock<Mutex<JITModule>> = LazyLock::new(|| {
+    let jit_builder = JITBuilder::new(cranelift_module::default_libcall_names()).unwrap();
+    Mutex::new(JITModule::new(jit_builder))
+});
+
+static FUNCTION_BUILDER_CONTEXT: LazyLock<Mutex<FunctionBuilderContext>> =
+    LazyLock::new(|| Mutex::new(FunctionBuilderContext::new()));
+
+#[derive(Debug)]
 enum Expr {
-    Var(usize),
     Int(i64),
-    Ptr(i64),
-    Assign,
-    Deref(Ty),
-    Id,
-    Add,
-    Call(Vec<Ty>, Box<Ty>, Vec<Ty>),
-    Comp {
-        outer_func: Box<Expr>,
-        inner_funcs: Vec<Expr>,
-    },
+    DefVar(usize, Box<Expr>),
+    UseVar(usize),
+    Exprs(Vec<Expr>),
+    Tys(Vec<Ty>),
+    Ty(Ty),
+    App(Func, Vec<Expr>),
 }
 
+#[derive(Debug)]
+enum Func {
+    Builtin(i64, Vec<Ty>, Ty),
+    Defined(FuncId),
+    Expr(Box<Expr>, Vec<Ty>, Ty),
+}
+
+#[derive(Debug, Clone, Copy)]
 enum Ty {
     Int,
     Ptr,
 }
 
 impl Ty {
-    fn translate(&self, ptr_ty: Type) -> Type {
+    fn translate(&self) -> Type {
         match self {
             Ty::Int => types::I64,
-            Ty::Ptr => ptr_ty,
+            Ty::Ptr => JIT_MODULE.lock().unwrap().isa().pointer_type(),
         }
     }
 }
 
-fn define(
-    module: &mut JITModule,
-    exprs: &[Expr],
-    args_ty: &[Ty],
-    ret_ty: &Ty,
-    vars_ty: &[Ty],
-) -> *const u8 {
+fn compile(func_id: FuncId, exprs: Vec<Expr>, args_ty: &[Ty], ret_ty: &Ty) -> *const u8 {
+    let module = JIT_MODULE.lock().unwrap();
     let mut ctx = module.make_context();
     ctx.func.signature = module.make_signature();
-    let ptr_ty = module.isa().pointer_type();
-    let call_conv = ctx.func.signature.call_conv;
-    ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+    drop(module);
     for arg_ty in args_ty {
         ctx.func
             .signature
             .params
-            .push(AbiParam::new(arg_ty.translate(ptr_ty)));
+            .push(AbiParam::new(arg_ty.translate()));
     }
     ctx.func
         .signature
         .returns
-        .push(AbiParam::new(ret_ty.translate(ptr_ty)));
-    let mut fn_builder_ctx = FunctionBuilderContext::new();
-    let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
-    let slots: Vec<_> = {
-        vars_ty
-            .iter()
-            .map(|ty| {
-                let data = StackSlotData {
-                    kind: StackSlotKind::ExplicitSlot,
-                    size: ty.translate(ptr_ty).bytes(),
-                };
-                builder.create_sized_stack_slot(data)
-            })
-            .collect()
-    };
-    let block = builder.create_block();
-    builder.append_block_params_for_function_params(block);
-    builder.switch_to_block(block);
-    let args = builder.block_params(block).to_vec();
-    let ret = exprs
-        .iter()
-        .map(|expr| expr.translate(&mut builder, ptr_ty, &args, &slots, call_conv))
-        .last()
-        .unwrap();
-    builder.ins().return_(&[ret]);
-    let func = module
+        .push(AbiParam::new(ret_ty.translate()));
+    {
+        let mut builder_ctx = FUNCTION_BUILDER_CONTEXT.lock().unwrap();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let ret = exprs
+            .into_iter()
+            .map(|expr| expr.translate(&mut builder))
+            .last()
+            .unwrap();
+        builder.ins().return_(&[ret]);
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+    let mut module = JIT_MODULE.lock().unwrap();
+    module.define_function(func_id, &mut ctx).unwrap();
+    module.finalize_definitions().unwrap();
+    module.get_finalized_function(func_id)
+}
+
+unsafe extern "C" fn compile_expr(
+    expr: *mut Expr,
+    num_args: usize,
+    args_ty: *const Ty,
+    ret_ty: &Ty,
+) -> *const u8 {
+    let module = JIT_MODULE.lock().unwrap();
+    let mut ctx = module.make_context();
+    ctx.func.signature = module.make_signature();
+    drop(module);
+    let args_ty = unsafe { std::slice::from_raw_parts(args_ty, num_args) };
+    for arg_ty in args_ty {
+        ctx.func
+            .signature
+            .params
+            .push(AbiParam::new(arg_ty.translate()));
+    }
+    ctx.func
+        .signature
+        .returns
+        .push(AbiParam::new(ret_ty.translate()));
+    {
+        let mut builder_ctx = FUNCTION_BUILDER_CONTEXT.lock().unwrap();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let expr = *unsafe { Box::from_raw(expr) };
+        let ret = expr.translate(&mut builder);
+        builder.ins().return_(&[ret]);
+    }
+    let mut module = JIT_MODULE.lock().unwrap();
+    let func_id = module
         .declare_anonymous_function(&ctx.func.signature)
         .unwrap();
-    module.define_function(func, &mut ctx).unwrap();
-    println!("{}", ctx.func.display());
+    module.define_function(func_id, &mut ctx).unwrap();
     module.finalize_definitions().unwrap();
-    module.get_finalized_function(func)
+    module.get_finalized_function(func_id)
 }
 
 impl Expr {
-    fn translate(
-        &self,
-        builder: &mut FunctionBuilder,
-        ptr_ty: Type,
-        args: &[Value],
-        slots: &[ir::StackSlot],
-        call_conv: CallConv,
-    ) -> Value {
-        match *self {
-            Expr::Var(idx) => builder.ins().stack_addr(ptr_ty, slots[idx], 0),
-            Expr::Assign => {
-                builder.ins().store(MemFlags::new(), args[2], args[1], 0);
-                args[1]
-            }
-            Expr::Deref(ref ty) => {
-                builder
-                    .ins()
-                    .load(ty.translate(ptr_ty), MemFlags::new(), args[1], 0)
-            }
-            Expr::Id => args[1],
+    fn translate(self, builder: &mut FunctionBuilder) -> Value {
+        match self {
             Expr::Int(value) => builder.ins().iconst(types::I64, value),
-            Expr::Ptr(value) => builder.ins().iconst(ptr_ty, value),
-            Expr::Add => builder.ins().iadd(args[1], args[2]),
-            Expr::Call(ref args_ty, ref ret_ty, ref vars_ty) => {
-                let func = {
-                    let define_ptr = builder.ins().iconst(ptr_ty, define as i64);
-                    let define_args = vec![
-                        args[0],
-                        args[1],
-                        builder.ins().iconst(ptr_ty, 1),
-                        builder.ins().iconst(ptr_ty, args_ty as *const _ as i64),
-                        builder.ins().iconst(ptr_ty, args_ty.len() as i64),
-                        builder.ins().iconst(ptr_ty, ret_ty as *const _ as i64),
-                        builder.ins().iconst(ptr_ty, vars_ty as *const _ as i64),
-                        builder.ins().iconst(ptr_ty, vars_ty.len() as i64),
-                    ];
-
-                    let mut sig = Signature::new(call_conv);
-                    for _ in &define_args {
-                        sig.params.push(AbiParam::new(ptr_ty));
-                    }
-                    sig.returns.push(AbiParam::new(ptr_ty));
-                    let sig = builder.import_signature(sig);
-
-                    let define_inst = builder.ins().call_indirect(sig, define_ptr, &define_args);
-                    builder.inst_results(define_inst)[0]
-                };
-
-                let mut sig = Signature::new(call_conv);
-                sig.params.push(AbiParam::new(ptr_ty));
+            Expr::App(Func::Builtin(ptr, args_ty, ret_ty), args) => {
+                let mut sig = Signature::new(builder.func.signature.call_conv);
                 for arg_ty in args_ty {
-                    sig.params.push(AbiParam::new(arg_ty.translate(ptr_ty)));
+                    sig.params.push(AbiParam::new(arg_ty.translate()));
                 }
-                sig.returns.push(AbiParam::new(ret_ty.translate(ptr_ty)));
+                sig.returns.push(AbiParam::new(ret_ty.translate()));
                 let sig = builder.import_signature(sig);
-                let new_args: Vec<_> = iter::once(&args[0]).chain(&args[2..]).cloned().collect();
-                let inst = builder.ins().call_indirect(sig, func, &new_args);
+                let func = builder.ins().iconst(types::I64, ptr);
+                let args: Vec<_> = args.into_iter().map(|arg| arg.translate(builder)).collect();
+                let inst = builder.ins().call_indirect(sig, func, &args);
                 builder.inst_results(inst)[0]
             }
-            Expr::Comp {
-                ref outer_func,
-                ref inner_funcs,
-            } => {
-                let intermediates: Vec<_> = iter::once(args[0])
-                    .chain(inner_funcs.iter().map(|inner_func| {
-                        inner_func.translate(builder, ptr_ty, args, slots, call_conv)
-                    }))
-                    .collect();
-                outer_func.translate(builder, ptr_ty, &intermediates, slots, call_conv)
+            Expr::App(Func::Expr(expr, args_ty, ret_ty), args) => {
+                let mut sig = Signature::new(builder.func.signature.call_conv);
+                sig.params.resize(2, AbiParam::new(types::I64));
+                let sig = builder.import_signature(sig);
+                let compile_expr_ptr = builder.ins().iconst(types::I64, compile_expr as i64);
+                let v_expr = expr.translate(builder);
+                let v_num_args = builder.ins().iconst(types::I64, args.len() as i64);
+                let v_args_ty = builder.ins().iconst(types::I64, args_ty.as_ptr() as i64);
+                let v_ret_ty = builder
+                    .ins()
+                    .iconst(types::I64, &ret_ty as *const Ty as i64);
+                let inst = builder.ins().call_indirect(
+                    sig,
+                    compile_expr_ptr,
+                    &[v_expr, v_num_args, v_args_ty, v_ret_ty],
+                );
+                let func = builder.inst_results(inst)[0];
+                let mut sig = Signature::new(builder.func.signature.call_conv);
+                for arg_ty in args_ty {
+                    sig.params.push(AbiParam::new(arg_ty.translate()));
+                }
+                sig.returns.push(AbiParam::new(ret_ty.translate()));
+                let sig = builder.import_signature(sig);
+                let args: Vec<_> = args.into_iter().map(|arg| arg.translate(builder)).collect();
+                let inst = builder.ins().call_indirect(sig, func, &args);
+                builder.inst_results(inst)[0]
             }
+            Expr::Ty(ty) => builder
+                .ins()
+                .iconst(types::I64, Box::into_raw(Box::new(ty)) as i64),
+            Expr::Exprs(exprs) => builder
+                .ins()
+                .iconst(types::I64, Box::into_raw(Box::new(exprs)) as i64),
+            Expr::Tys(tys) => builder
+                .ins()
+                .iconst(types::I64, Box::into_raw(Box::new(tys)) as i64),
+            _ => todo!(),
         }
     }
 }
 
-fn main() {
-    let jit_module_builder = JITBuilder::new(cranelift_module::default_libcall_names()).unwrap();
-    let mut jit_module = JITModule::new(jit_module_builder);
+fn const_expr(expr: Expr) -> Expr {
+    match expr {
+        Expr::Int(value) => Expr::App(
+            Func::Builtin(make_int as i64, vec![Ty::Int], Ty::Ptr),
+            vec![Expr::Int(value)],
+        ),
+        Expr::App(func, args) => Expr::App(
+            Func::Builtin(make_app as i64, vec![Ty::Ptr, Ty::Ptr], Ty::Ptr),
+            vec![
+                const_func(func),
+                Expr::Exprs(args.into_iter().map(const_expr).collect()),
+            ],
+        ),
+        _ => todo!(),
+    }
+}
 
-    {
-        let expr = Expr::Comp {
-            outer_func: Box::new(Expr::Deref(Ty::Int)),
-            inner_funcs: vec![Expr::Comp {
-                outer_func: Box::new(Expr::Assign),
-                inner_funcs: vec![Expr::Var(0), Expr::Int(10)],
-            }],
-        };
-        let ptr = define(&mut jit_module, &[expr], &[], &Ty::Int, &[Ty::Int]);
-        let func: unsafe fn(*mut JITModule) -> i32 = unsafe { std::mem::transmute(ptr) };
-        dbg!(unsafe { func(&mut jit_module) });
+fn const_func(func: Func) -> Expr {
+    match func {
+        Func::Builtin(ptr, args_ty, ret_ty) => Expr::App(
+            Func::Builtin(
+                make_builtin as i64,
+                vec![Ty::Int, Ty::Ptr, Ty::Ptr],
+                Ty::Ptr,
+            ),
+            vec![Expr::Int(ptr), Expr::Tys(args_ty), Expr::Ty(ret_ty)],
+        ),
+        _ => todo!(),
     }
-    {
-        let expr = Expr::Comp {
-            outer_func: Box::new(Expr::Add),
-            inner_funcs: vec![Expr::Id, Expr::Int(1)],
-        };
-        let ptr = define(&mut jit_module, &[expr], &[Ty::Int], &Ty::Int, &[]);
-        let func: unsafe fn(*mut JITModule, i64) -> i64 = unsafe { std::mem::transmute(ptr) };
-        dbg!(unsafe { func(&mut jit_module, 10) });
-    }
-    {
-        let expr1 = Expr::Comp {
-            outer_func: Box::new(Expr::Assign),
-            inner_funcs: vec![
-                Expr::Var(0),
-                Expr::Ptr(Box::into_raw(Box::new(Expr::Comp {
-                    outer_func: Box::new(Expr::Add),
-                    inner_funcs: vec![Expr::Id, Expr::Int(1)],
-                })) as i64),
-            ],
-        };
-        let expr2 = Expr::Comp {
-            outer_func: Box::new(Expr::Call(vec![Ty::Int], Box::new(Ty::Int), vec![])),
-            inner_funcs: vec![
-                Expr::Comp {
-                    outer_func: Box::new(Expr::Deref(Ty::Int)),
-                    inner_funcs: vec![Expr::Var(0)],
-                },
-                Expr::Int(10),
-            ],
-        };
-        let ptr = define(&mut jit_module, &[expr1, expr2], &[], &Ty::Int, &[Ty::Int]);
-        let func: unsafe fn(*mut JITModule) -> i64 = unsafe { std::mem::transmute(ptr) };
-        dbg!(unsafe { func(&mut jit_module) });
-    }
+}
+
+extern "C" fn make_int(value: i64) -> *mut Expr {
+    Box::into_raw(Box::new(Expr::Int(value)))
+}
+
+unsafe extern "C" fn make_app(func: *mut Func, args: *mut Vec<Expr>) -> *mut Expr {
+    let func = *unsafe { Box::from_raw(func) };
+    let args = *unsafe { Box::from_raw(args) };
+    Box::into_raw(Box::new(Expr::App(func, args)))
+}
+
+extern "C" fn print_integer(value: i64) -> i64 {
+    println!("{}", value);
+    value
+}
+
+unsafe extern "C" fn make_exprs(exprs: *mut Vec<Expr>) -> *mut Expr {
+    let exprs = *unsafe { Box::from_raw(exprs) };
+    Box::into_raw(Box::new(Expr::Exprs(exprs)))
+}
+
+unsafe extern "C" fn make_tys(tys: *mut Vec<Ty>) -> *mut Expr {
+    let tys = *unsafe { Box::from_raw(tys) };
+    Box::into_raw(Box::new(Expr::Tys(tys)))
+}
+
+unsafe extern "C" fn make_ty(ty: *mut Ty) -> *mut Expr {
+    let ty = *unsafe { Box::from_raw(ty) };
+    Box::into_raw(Box::new(Expr::Ty(ty)))
+}
+
+extern "C" fn new_vec_expr() -> *mut Vec<Expr> {
+    Box::into_raw(Box::new(Vec::new()))
+}
+
+unsafe extern "C" fn push_vec_expr(vec: *mut Vec<Expr>, expr: *mut Expr) {
+    unsafe { (*vec).push(*Box::from_raw(expr)) };
+}
+
+unsafe extern "C" fn make_builtin(ptr: i64, args_ty: *mut Vec<Ty>, ret_ty: *mut Ty) -> *mut Func {
+    let args_ty = *unsafe { Box::from_raw(args_ty) };
+    let ret_ty = *unsafe { Box::from_raw(ret_ty) };
+    Box::into_raw(Box::new(Func::Builtin(ptr, args_ty, ret_ty)))
+}
+
+fn main() {
+    println!("make_builtin: {}", make_builtin as usize);
+    println!("make_int: {}", make_int as usize);
+    println!("make_app: {}", make_app as usize);
+    let func_id = {
+        let mut module = JIT_MODULE.lock().unwrap();
+        let signature = module.make_signature();
+        module.declare_anonymous_function(&signature).unwrap()
+    };
+    let expr = const_expr(const_expr(Expr::Int(42)));
+    println!("{expr:?}");
+    let ptr = compile(func_id, vec![expr], &[], &Ty::Ptr);
+    let func: unsafe fn() -> *mut Expr = unsafe { std::mem::transmute(ptr) };
+    let expr = *unsafe { Box::from_raw(func()) };
+    println!("{expr:?}");
+    let func_id = {
+        let mut module = JIT_MODULE.lock().unwrap();
+        let signature = module.make_signature();
+        module.declare_anonymous_function(&signature).unwrap()
+    };
+    let ptr = compile(func_id, vec![expr], &[], &Ty::Int);
+    let func: unsafe fn() -> *mut Expr = unsafe { std::mem::transmute(ptr) };
+    let expr = *unsafe { Box::from_raw(func()) };
+    println!("{expr:?}");
+    let func_id = {
+        let mut module = JIT_MODULE.lock().unwrap();
+        let signature = module.make_signature();
+        module.declare_anonymous_function(&signature).unwrap()
+    };
+    let ptr = compile(func_id, vec![expr], &[], &Ty::Int);
+    let func: unsafe fn() -> i64 = unsafe { std::mem::transmute(ptr) };
+    dbg!(unsafe { func() });
 }
